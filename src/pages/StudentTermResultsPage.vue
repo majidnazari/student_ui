@@ -15,6 +15,7 @@ const search = reactive({
 const students = ref([]);
 const selectedStudentId = ref(null);
 const report = ref(null);
+
 const lessons = ref([]);
 
 // modal/form state
@@ -31,7 +32,7 @@ const form = reactive({
   description: "",
 });
 
-// ---------- utils
+// ---------- helpers
 const safeFullName = (s) => {
   if (!s) return "";
   if (s.full_name) return s.full_name;
@@ -44,6 +45,13 @@ const gradeStatusText = (s) => {
   const v = Number(s);
   const map = { 1: "قبول", 2: "مردود", 3: "ناقص", 4: "حذف" };
   return map[v] ?? String(s ?? "");
+};
+
+const photoUrl = (photo_path) => {
+  if (!photo_path) return "";
+  // اگر photo_path با /storage شروع میشه، باید host هم اضافه کنیم
+  if (photo_path.startsWith("http")) return photo_path;
+  return `http://127.0.0.1:8000${photo_path}`;
 };
 
 const resetForm = () => {
@@ -89,8 +97,6 @@ const searchStudents = async () => {
     const res = await http.get("/students", {
       params: { ...search, per_page: 20 },
     });
-
-    // Laravel paginator returns {data: [...]}
     students.value = res?.data?.data ?? [];
   } catch (e) {
     error.value = e?.response?.data?.message ?? "خطا در دریافت لیست دانشجوها";
@@ -161,15 +167,12 @@ const submit = async () => {
     if (form.mode === "create") {
       await http.post(`/terms/${form.termId}/results`, payload);
     } else {
-      if (!form.resultId) throw new Error("resultId missing");
       await http.put(`/results/${form.resultId}`, payload);
     }
 
-    // refresh report
     await loadReport(selectedStudentId.value);
   } catch (e) {
     if (e?.response?.status === 422) {
-      // show laravel validation errors (first message)
       const errs = e?.response?.data?.errors;
       const firstKey = errs ? Object.keys(errs)[0] : null;
       error.value = firstKey ? errs[firstKey][0] : "Validation Error";
@@ -183,8 +186,7 @@ const submit = async () => {
 
 const removeResult = async (resultId) => {
   if (!resultId) return;
-  const ok = confirm("حذف شود؟");
-  if (!ok) return;
+  if (!confirm("حذف شود؟")) return;
 
   error.value = "";
   loading.value = true;
@@ -207,7 +209,7 @@ onMounted(async () => {
   <div class="page">
     <!-- Search -->
     <div class="card">
-      <h2>مدیریت نمرات ترم دانشجو</h2>
+      <h2>نمرات ترم دانشجو</h2>
 
       <div class="grid">
         <div>
@@ -249,9 +251,10 @@ onMounted(async () => {
 
     <!-- Report -->
     <div v-if="report" class="card">
+      <!-- ✅ Header with photo -->
       <div class="header">
         <div class="photo">
-          <img v-if="report.photo_path" :src="report.photo_path" alt="photo" />
+          <img v-if="report.photo_path" :src="photoUrl(report.photo_path)" alt="photo" />
           <div v-else class="no-photo">بدون عکس</div>
         </div>
 
@@ -405,137 +408,44 @@ onMounted(async () => {
   grid-template-columns: repeat(2, 1fr);
   gap: 12px;
 }
-label {
-  display: block;
-  font-size: 12px;
-  margin-bottom: 6px;
-  color: #333;
-}
-input, select {
-  width: 100%;
-  padding: 10px;
-  border: 1px solid #ddd;
-  border-radius: 8px;
-}
-.list {
-  margin-top: 12px;
-  display: grid;
-  gap: 8px;
-}
-.list-item {
-  border: 1px solid #eee;
-  border-radius: 8px;
-  padding: 10px;
-  cursor: pointer;
-}
+label { display: block; font-size: 12px; margin-bottom: 6px; color: #333; }
+input, select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 8px; }
+.list { margin-top: 12px; display: grid; gap: 8px; }
+.list-item { border: 1px solid #eee; border-radius: 8px; padding: 10px; cursor: pointer; }
 .list-item:hover { background: #fafafa; }
 .list-item.active { border-color: #999; }
 .title { font-weight: 700; }
 .muted { color: #666; font-size: 12px; }
 .error { margin-top: 10px; color: #b00020; font-weight: 700; }
 
-.header {
-  display: flex;
-  gap: 16px;
-  align-items: center;
-  margin-bottom: 16px;
-}
-.photo img {
-  width: 120px;
-  height: 120px;
-  object-fit: cover;
-  border-radius: 10px;
-  border: 1px solid #eee;
-}
-.no-photo {
-  width: 120px;
-  height: 120px;
-  display: grid;
-  place-items: center;
-  border-radius: 10px;
-  border: 1px dashed #bbb;
-  color: #666;
-  font-size: 12px;
-}
+.header { display: flex; gap: 16px; align-items: center; margin-bottom: 16px; }
+.photo img { width: 120px; height: 120px; object-fit: cover; border-radius: 12px; border: 1px solid #eee; }
+.no-photo { width: 120px; height: 120px; display: grid; place-items: center; border-radius: 12px; border: 1px dashed #bbb; color: #666; font-size: 12px; }
 .meta { flex: 1; }
-.row {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
-  margin-bottom: 8px;
-}
+.row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 8px; }
 
-.term {
-  border-top: 1px solid #eee;
-  padding-top: 12px;
-  margin-top: 12px;
-}
-.term-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
+.term { border-top: 1px solid #eee; padding-top: 12px; margin-top: 12px; }
+.term-head { display: flex; align-items: center; justify-content: space-between; }
 .right { display: flex; gap: 10px; align-items: center; }
 .avg { font-weight: 700; }
 
-table {
-  width: 100%;
-  border-collapse: collapse;
-  margin-top: 10px;
-}
-th, td {
-  border: 1px solid #eee;
-  padding: 8px;
-  font-size: 13px;
-}
+table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+th, td { border: 1px solid #eee; padding: 8px; font-size: 13px; }
 th { background: #fafafa; }
 .actions { display: flex; gap: 8px; justify-content: flex-end; }
 
-.btn {
-  border: 1px solid #ddd;
-  background: white;
-  padding: 8px 12px;
-  border-radius: 10px;
-  cursor: pointer;
-}
+.btn { border: 1px solid #ddd; background: white; padding: 8px 12px; border-radius: 10px; cursor: pointer; }
 .btn:hover { background: #f7f7f7; }
 .btn.small { padding: 6px 10px; border-radius: 8px; }
 .btn.secondary { background: #fafafa; }
 .btn.danger { border-color: #ffb3b3; }
 .btn.danger:hover { background: #fff0f0; }
 
-.modal {
-  position: fixed;
-  inset: 0;
-  background: rgba(0,0,0,.35);
-  display: grid;
-  place-items: center;
-  padding: 16px;
-}
-.modal-card {
-  width: min(780px, 100%);
-  background: white;
-  border-radius: 12px;
-  padding: 16px;
-}
-.modal-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 10px;
-}
-.x {
-  border: 0;
-  background: transparent;
-  font-size: 18px;
-  cursor: pointer;
-}
-.modal-actions {
-  display: flex;
-  gap: 10px;
-  justify-content: flex-end;
-  margin-top: 12px;
-}
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: grid; place-items: center; padding: 16px; }
+.modal-card { width: min(780px, 100%); background: white; border-radius: 12px; padding: 16px; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.x { border: 0; background: transparent; font-size: 18px; cursor: pointer; }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
 
 @media (max-width: 900px) {
   .grid, .row, .grid2 { grid-template-columns: 1fr; }
