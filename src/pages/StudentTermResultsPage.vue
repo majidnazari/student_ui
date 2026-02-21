@@ -1,27 +1,42 @@
 <script setup>
-import { ref, computed, reactive, onMounted } from "vue";
+import { ref, reactive, computed, onMounted } from "vue";
 import { http } from "../api/http";
 
-// ---------- state
 const loading = ref(false);
 const error = ref("");
 
-const search = reactive({
+const q = reactive({
+  // Row 1 (auto suggest)
   student_number: "",
   first_name: "",
   last_name: "",
+
+  // Row 2 (manual filters)
+  college_id: "",
+  education_group_id: "",
+  major_id: "",
+
+  per_page: 50,
 });
 
-const students = ref([]);
+const lookups = reactive({
+  colleges: [],
+  educationGroups: [],
+  majors: [],
+  lessons: [],
+});
+
+const students = ref([]);       // نتیجه جستجوی کلی (دکمه جستجو)
+const suggestions = ref([]);    // پیشنهادهای سریع
+const showSuggestions = ref(false);
+
 const selectedStudentId = ref(null);
 const report = ref(null);
 
-const lessons = ref([]);
-
-// modal/form state
+// modal for add/edit result
 const form = reactive({
   open: false,
-  mode: "create", // create | edit
+  mode: "create",
   termId: null,
   resultId: null,
 
@@ -32,13 +47,17 @@ const form = reactive({
   description: "",
 });
 
-// ---------- helpers
+// ---------------- helpers
 const safeFullName = (s) => {
   if (!s) return "";
   if (s.full_name) return s.full_name;
-  const fn = s.first_name ?? "";
-  const ln = s.last_name ?? "";
-  return `${fn} ${ln}`.trim();
+  return `${s.first_name ?? ""} ${s.last_name ?? ""}`.trim();
+};
+
+const photoUrl = (photo_path) => {
+  if (!photo_path) return "";
+  if (photo_path.startsWith("http")) return photo_path;
+  return `http://127.0.0.1:8000${photo_path}`;
 };
 
 const gradeStatusText = (s) => {
@@ -47,11 +66,30 @@ const gradeStatusText = (s) => {
   return map[v] ?? String(s ?? "");
 };
 
-const photoUrl = (photo_path) => {
-  if (!photo_path) return "";
-  // اگر photo_path با /storage شروع میشه، باید host هم اضافه کنیم
-  if (photo_path.startsWith("http")) return photo_path;
-  return `http://127.0.0.1:8000${photo_path}`;
+const canAutoSuggest = computed(() => {
+  return Boolean(q.student_number || q.first_name || q.last_name);
+});
+
+const canSearchAll = computed(() => {
+  return Boolean(
+    q.student_number ||
+      q.first_name ||
+      q.last_name ||
+      q.college_id ||
+      q.education_group_id ||
+      q.major_id
+  );
+});
+
+// ✅ برای حل overlap: وقتی dropdown باز است، یک فضای اضافی زیر ردیف اول می‌دهیم
+const suggestionSpace = computed(() => (showSuggestions.value ? 220 : 0));
+
+const termAverage = (term) => {
+  const results = Array.isArray(term?.results) ? term.results : [];
+  const rows = results.filter((r) => r?.grade !== null && r?.grade !== undefined && r?.grade !== "");
+  if (!rows.length) return "0.00";
+  const sum = rows.reduce((a, r) => a + Number(r.grade), 0);
+  return (sum / rows.length).toFixed(2);
 };
 
 const resetForm = () => {
@@ -66,60 +104,139 @@ const resetForm = () => {
   form.description = "";
 };
 
-const canSearch = computed(() => {
-  return Boolean(search.student_number || search.first_name || search.last_name);
-});
-
-const termAverage = (term) => {
-  const results = Array.isArray(term?.results) ? term.results : [];
-  const rows = results.filter((r) => r?.grade !== null && r?.grade !== undefined && r?.grade !== "");
-  if (!rows.length) return "0.00";
-  const sum = rows.reduce((a, r) => a + Number(r.grade), 0);
-  return (sum / rows.length).toFixed(2);
+// ✅ blur/focus stable
+let blurTimer = null;
+const closeSuggestionsWithDelay = () => {
+  if (blurTimer) clearTimeout(blurTimer);
+  blurTimer = window.setTimeout(() => {
+    showSuggestions.value = false;
+  }, 180);
 };
 
-// ---------- api
-const loadLessons = async () => {
-  const res = await http.get("/lookups/lessons");
-  lessons.value = Array.isArray(res.data) ? res.data : [];
+const openSuggestionsIfAny = () => {
+  if (suggestions.value.length) showSuggestions.value = true;
 };
 
-const searchStudents = async () => {
+// ---------------- API: lookups
+const loadLookups = async () => {
+  const [colleges, educationGroups, lessons] = await Promise.all([
+    http.get("/lookups/colleges"),
+    http.get("/lookups/education-groups"),
+    http.get("/lookups/lessons"),
+  ]);
+
+  lookups.colleges = colleges.data || [];
+  lookups.educationGroups = educationGroups.data || [];
+  lookups.lessons = lessons.data || [];
+};
+
+const loadMajors = async () => {
+  if (!q.education_group_id) {
+    lookups.majors = [];
+    q.major_id = "";
+    return;
+  }
+  const res = await http.get("/lookups/majors", {
+    params: { education_group_id: q.education_group_id },
+  });
+  lookups.majors = res.data || [];
+};
+
+// ---------------- Auto Suggest
+const clearSuggestions = () => {
+  suggestions.value = [];
+  showSuggestions.value = false;
+};
+
+const fetchSuggestions = async () => {
   error.value = "";
-  students.value = [];
-  report.value = null;
-  selectedStudentId.value = null;
 
-  if (!canSearch.value) return;
+  // اگر هر سه تا خالی شد => پیشنهادها بسته
+  if (!canAutoSuggest.value) {
+    clearSuggestions();
+    return;
+  }
 
   loading.value = true;
   try {
+    // فقط 3 فیلد بالا
     const res = await http.get("/students", {
-      params: { ...search, per_page: 20 },
+      params: {
+        student_number: q.student_number,
+        first_name: q.first_name,
+        last_name: q.last_name,
+        per_page: 10,
+      },
     });
-    students.value = res?.data?.data ?? [];
+
+    const rows = res?.data?.data ?? [];
+    suggestions.value = rows;
+
+    // فقط اگر چیزی داریم بازش کن
+    showSuggestions.value = rows.length > 0;
   } catch (e) {
-    error.value = e?.response?.data?.message ?? "خطا در دریافت لیست دانشجوها";
+    error.value = e?.response?.data?.message ?? "خطا در دریافت پیشنهادها";
+    clearSuggestions();
   } finally {
     loading.value = false;
   }
 };
 
+let tmr = null;
+const autoSuggestDebounced = () => {
+  if (tmr) clearTimeout(tmr);
+  tmr = window.setTimeout(fetchSuggestions, 250);
+};
+
+const pickSuggestion = async (s) => {
+  clearSuggestions();
+
+  q.student_number = s.student_number ?? "";
+  q.first_name = s.first_name ?? "";
+  q.last_name = s.last_name ?? "";
+
+  await loadReport(s.id);
+};
+
+// ---------------- Manual Search
+const searchStudentsAll = async () => {
+  error.value = "";
+  report.value = null;
+  selectedStudentId.value = null;
+  students.value = [];
+  clearSuggestions();
+
+  if (!canSearchAll.value) return;
+
+  loading.value = true;
+  try {
+    const res = await http.get("/students", { params: q });
+    students.value = res?.data?.data ?? [];
+  } catch (e) {
+    error.value = e?.response?.data?.message ?? "خطا در جستجوی دانشجوها";
+  } finally {
+    loading.value = false;
+  }
+};
+
+// ---------------- report
 const loadReport = async (id) => {
   error.value = "";
   loading.value = true;
+
   try {
     const res = await http.get(`/students/${id}`);
     report.value = res.data;
     selectedStudentId.value = id;
     resetForm();
   } catch (e) {
-    error.value = e?.response?.data?.message ?? "خطا در دریافت گزارش دانشجو";
+    error.value = e?.response?.data?.message ?? "خطا در دریافت کارنامه دانشجو";
   } finally {
     loading.value = false;
   }
 };
 
+// ---------------- results CRUD
 const openCreateForTerm = (termId) => {
   resetForm();
   form.open = true;
@@ -143,15 +260,8 @@ const openEdit = (termId, r) => {
 
 const submit = async () => {
   error.value = "";
-
-  if (!form.termId) {
-    error.value = "ترم انتخاب نشده است.";
-    return;
-  }
-  if (!form.lesson_id) {
-    error.value = "درس را انتخاب کن.";
-    return;
-  }
+  if (!form.termId) return (error.value = "ترم انتخاب نشده است.");
+  if (!form.lesson_id) return (error.value = "درس را انتخاب کن.");
 
   loading.value = true;
 
@@ -169,7 +279,6 @@ const submit = async () => {
     } else {
       await http.put(`/results/${form.resultId}`, payload);
     }
-
     await loadReport(selectedStudentId.value);
   } catch (e) {
     if (e?.response?.status === 422) {
@@ -200,58 +309,150 @@ const removeResult = async (resultId) => {
   }
 };
 
+const clearAll = () => {
+  q.student_number = "";
+  q.first_name = "";
+  q.last_name = "";
+  q.college_id = "";
+  q.education_group_id = "";
+  q.major_id = "";
+  lookups.majors = [];
+
+  students.value = [];
+  report.value = null;
+  selectedStudentId.value = null;
+  clearSuggestions();
+  error.value = "";
+};
+
 onMounted(async () => {
-  await loadLessons();
+  await loadLookups();
 });
 </script>
 
 <template>
   <div class="page">
-    <!-- Search -->
     <div class="card">
-      <h2>نمرات ترم دانشجو</h2>
+      <h2>کارنامه ترم دانشجو</h2>
 
+      <!-- Row 1 -->
       <div class="grid">
-        <div>
-          <label>شماره دانشجویی</label>
-          <input v-model="search.student_number" @input="searchStudents" placeholder="40123456" />
+        <!-- ✅ فقط این فیلد dropdown دارد -->
+        <div class="relative">
+          <label>شماره دانشجویی (پیشنهاد سریع)</label>
+          <input
+            v-model="q.student_number"
+            @input="autoSuggestDebounced"
+            @focus="openSuggestionsIfAny"
+            @blur="closeSuggestionsWithDelay"
+            placeholder="مثلاً 001 یا 401..."
+          />
+
+          <div v-if="showSuggestions" class="suggestions">
+            <div
+              v-for="s in suggestions"
+              :key="s.id"
+              class="suggest-item"
+              @mousedown.prevent="pickSuggestion(s)"
+            >
+              <div class="s-title">{{ safeFullName(s) }} — {{ s.student_number }}</div>
+              <div class="s-sub">
+                {{ s?.college?.name ?? "-" }} | {{ s?.education_group?.name ?? "-" }} | {{ s?.major?.name ?? "-" }}
+              </div>
+            </div>
+          </div>
         </div>
+
         <div>
           <label>نام</label>
-          <input v-model="search.first_name" @input="searchStudents" placeholder="نام" />
+          <input v-model="q.first_name" @input="autoSuggestDebounced" placeholder="نام" />
         </div>
+
         <div>
           <label>نام خانوادگی</label>
-          <input v-model="search.last_name" @input="searchStudents" placeholder="نام خانوادگی" />
+          <input v-model="q.last_name" @input="autoSuggestDebounced" placeholder="نام خانوادگی" />
         </div>
+      </div>
+
+      <!-- ✅ Spacer برای جلوگیری از overlap -->
+      <div :style="{ height: suggestionSpace + 'px' }"></div>
+
+      <!-- Row 2 -->
+      <div class="grid">
+        <div>
+          <label>دانشکده</label>
+          <select v-model="q.college_id">
+            <option value="">همه</option>
+            <option v-for="c in lookups.colleges" :key="c.id" :value="c.id">{{ c.name }}</option>
+          </select>
+        </div>
+
+        <div>
+          <label>گروه آموزشی</label>
+          <select v-model="q.education_group_id" @change="loadMajors">
+            <option value="">همه</option>
+            <option v-for="g in lookups.educationGroups" :key="g.id" :value="g.id">{{ g.name }}</option>
+          </select>
+        </div>
+
+        <div>
+          <label>رشته</label>
+          <select v-model="q.major_id">
+            <option value="">همه</option>
+            <option v-for="m in lookups.majors" :key="m.id" :value="m.id">{{ m.name }}</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="actionsTop">
+        <button class="btn" @click="searchStudentsAll" :disabled="loading || !canSearchAll">
+          جستجو (همه فیلترها)
+        </button>
+        <button class="btn secondary" @click="clearAll">پاک کردن</button>
       </div>
 
       <div v-if="error" class="error">{{ error }}</div>
       <div v-if="loading" class="muted">در حال دریافت...</div>
+    </div>
 
-      <div v-if="students.length" class="list">
-        <div
-          v-for="s in students"
-          :key="s.id"
-          class="list-item"
-          :class="{ active: s.id === selectedStudentId }"
-          @click="loadReport(s.id)"
-        >
-          <div class="title">{{ safeFullName(s) }} — {{ s.student_number }}</div>
-          <div class="muted">
-            {{ s?.college?.name ?? "-" }} | {{ s?.education_group?.name ?? "-" }} | {{ s?.major?.name ?? "-" }}
-          </div>
-        </div>
-      </div>
-
-      <div v-else class="muted" style="margin-top: 12px;">
-        برای نمایش لیست، حداقل یکی از فیلدها را وارد کن.
-      </div>
+    <!-- Table -->
+    <div v-if="students.length" class="card">
+      <h3>لیست دانشجوها</h3>
+      <table>
+        <thead>
+          <tr>
+            <th style="width:70px;">ID</th>
+            <th style="width:80px;">عکس</th>
+            <th>نام</th>
+            <th>شماره</th>
+            <th>دانشکده</th>
+            <th>گروه</th>
+            <th>رشته</th>
+            <th style="width:170px;">عملیات</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="s in students" :key="s.id">
+            <td>{{ s.id }}</td>
+            <td>
+              <img v-if="s.photo_path" :src="photoUrl(s.photo_path)" class="avatar" />
+              <div v-else class="no-avatar">-</div>
+            </td>
+            <td>{{ safeFullName(s) }}</td>
+            <td>{{ s.student_number }}</td>
+            <td>{{ s.college?.name ?? "-" }}</td>
+            <td>{{ s.education_group?.name ?? "-" }}</td>
+            <td>{{ s.major?.name ?? "-" }}</td>
+            <td class="btnCell">
+              <button class="btn small" @click="loadReport(s.id)">نمایش کارنامه</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
 
     <!-- Report -->
     <div v-if="report" class="card">
-      <!-- ✅ Header with photo -->
       <div class="header">
         <div class="photo">
           <img v-if="report.photo_path" :src="photoUrl(report.photo_path)" alt="photo" />
@@ -292,7 +493,7 @@ onMounted(async () => {
                 <th>وضعیت</th>
                 <th>استاد</th>
                 <th>توضیح</th>
-                <th style="width: 140px;">عملیات</th>
+                <th style="width:140px;">عملیات</th>
               </tr>
             </thead>
             <tbody>
@@ -304,16 +505,14 @@ onMounted(async () => {
                 <td>{{ gradeStatusText(r?.grade_status) }}</td>
                 <td>{{ r?.coach_name ?? "-" }}</td>
                 <td>{{ r?.description ?? "-" }}</td>
-                <td class="actions">
+                <td class="tableActions">
                   <button class="btn small" @click="openEdit(t.id, r)">ویرایش</button>
                   <button class="btn danger small" @click="removeResult(r.id)">حذف</button>
                 </td>
               </tr>
 
               <tr v-if="!t.results || t.results.length === 0">
-                <td colspan="8" class="muted" style="text-align:center;">
-                  هنوز درسی برای این ترم ثبت نشده است.
-                </td>
+                <td colspan="8" class="muted" style="text-align:center;">هنوز درسی ثبت نشده است</td>
               </tr>
             </tbody>
           </table>
@@ -336,7 +535,7 @@ onMounted(async () => {
             <label>درس</label>
             <select v-model="form.lesson_id">
               <option value="">انتخاب درس</option>
-              <option v-for="l in lessons" :key="l.id" :value="l.id">
+              <option v-for="l in lookups.lessons" :key="l.id" :value="l.id">
                 {{ l.code }} - {{ l.name }} ({{ l.unit }})
               </option>
             </select>
@@ -369,54 +568,42 @@ onMounted(async () => {
         </div>
 
         <div class="modal-actions">
-          <button class="btn" @click="submit" :disabled="loading">
-            {{ form.mode === "create" ? "ثبت" : "ذخیره" }}
-          </button>
+          <button class="btn" @click="submit" :disabled="loading">{{ form.mode === "create" ? "ثبت" : "ذخیره" }}</button>
           <button class="btn secondary" @click="resetForm">انصراف</button>
         </div>
 
-        <div v-if="error" class="error" style="margin-top: 10px;">{{ error }}</div>
+        <div v-if="error" class="error" style="margin-top:10px;">{{ error }}</div>
       </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.page {
-  max-width: 1200px;
-  margin: 30px auto;
-  padding: 0 16px;
-  direction: rtl;
-  font-family: Arial, sans-serif;
-  background: #f5f6fa;
-}
-.card {
-  background: white;
-  border: 1px solid #eee;
-  border-radius: 12px;
-  padding: 16px;
-  margin-bottom: 16px;
-}
-.grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
-  margin-top: 12px;
-}
-.grid2 {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 12px;
-}
+.page { max-width: 1200px; margin: 30px auto; padding: 0 16px; direction: rtl; font-family: Arial, sans-serif; background: #f5f6fa; }
+.card { background: white; border: 1px solid #eee; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.grid2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
 label { display: block; font-size: 12px; margin-bottom: 6px; color: #333; }
 input, select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 8px; }
-.list { margin-top: 12px; display: grid; gap: 8px; }
-.list-item { border: 1px solid #eee; border-radius: 8px; padding: 10px; cursor: pointer; }
-.list-item:hover { background: #fafafa; }
-.list-item.active { border-color: #999; }
-.title { font-weight: 700; }
-.muted { color: #666; font-size: 12px; }
+.actionsTop { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
 .error { margin-top: 10px; color: #b00020; font-weight: 700; }
+.muted { color: #666; font-size: 12px; margin-top: 10px; }
+
+table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+th, td { border: 1px solid #eee; padding: 8px; font-size: 13px; }
+th { background: #fafafa; }
+.btnCell { text-align: center; }
+.tableActions { display: flex; gap: 8px; justify-content: flex-end; }
+
+.btn { border: 1px solid #ddd; background: white; padding: 8px 12px; border-radius: 10px; cursor: pointer; }
+.btn:hover { background: #f7f7f7; }
+.btn.small { padding: 6px 10px; border-radius: 8px; }
+.btn.secondary { background: #fafafa; }
+.btn.danger { border-color:#ffb3b3; }
+.btn.danger:hover { background:#fff0f0; }
+
+.avatar { width: 44px; height: 44px; border-radius: 10px; object-fit: cover; border: 1px solid #eee; }
+.no-avatar { width: 44px; height: 44px; display: grid; place-items: center; color: #888; }
 
 .header { display: flex; gap: 16px; align-items: center; margin-bottom: 16px; }
 .photo img { width: 120px; height: 120px; object-fit: cover; border-radius: 12px; border: 1px solid #eee; }
@@ -429,17 +616,27 @@ input, select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radiu
 .right { display: flex; gap: 10px; align-items: center; }
 .avg { font-weight: 700; }
 
-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-th, td { border: 1px solid #eee; padding: 8px; font-size: 13px; }
-th { background: #fafafa; }
-.actions { display: flex; gap: 8px; justify-content: flex-end; }
-
-.btn { border: 1px solid #ddd; background: white; padding: 8px 12px; border-radius: 10px; cursor: pointer; }
-.btn:hover { background: #f7f7f7; }
-.btn.small { padding: 6px 10px; border-radius: 8px; }
-.btn.secondary { background: #fafafa; }
-.btn.danger { border-color: #ffb3b3; }
-.btn.danger:hover { background: #fff0f0; }
+/* suggestions */
+.relative { position: relative; }
+.suggestions {
+  position: absolute;
+  z-index: 50;
+  top: calc(100% + 6px);
+  right: 0;
+  left: 0;
+  background: #fff;
+  border: 1px solid #eee;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 10px 25px rgba(0,0,0,.08);
+  max-height: 200px;
+  overflow-y: auto;
+}
+.suggest-item { padding: 10px 12px; border-top: 1px solid #f3f3f3; cursor: pointer; }
+.suggest-item:first-child { border-top: 0; }
+.suggest-item:hover { background: #fafafa; }
+.s-title { font-weight: 700; font-size: 13px; }
+.s-sub { color: #666; font-size: 12px; margin-top: 4px; }
 
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: grid; place-items: center; padding: 16px; }
 .modal-card { width: min(780px, 100%); background: white; border-radius: 12px; padding: 16px; }
